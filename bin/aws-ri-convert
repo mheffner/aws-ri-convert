@@ -1,0 +1,2371 @@
+#!/usr/bin/env ruby
+
+$:.unshift File.join(File.dirname(__FILE__), '..', 'lib')
+
+require 'bundler'
+Bundler.require :default
+
+require 'csv'
+require 'optimist'
+require 'aws-sdk-ec2'
+require 'aws-sdk-costexplorer'
+require 'aws-sdk-pricing'
+require 'pp'
+require 'yaml'
+require 'time'
+
+require 'aws/ri/convert'
+
+include Aws::Ri::Convert
+
+REGION = ENV['AWS_DEFAULT_REGION'] || 'us-east-1'
+INST_CLASS_TYPES = %w(m1 m3 m4 m5 c3 c4 c5 i2 i3 r3 r4 r5 t2 t3)
+#INST_TYPES = %w(c5)
+INST_SIZE = 'large'
+
+RI_OFFERINGS_FILE = 'reserved_instance_offerings'
+SUBSET_SUMS_FILE = 'subset_sums.yml'
+
+INST_TYPE_BASE = 't2.nano'
+
+# XXX: NO API THAT PROVIDES THIS???
+REGION_LOC_MAP = {
+  "us-gov-west-1": "AWS GovCloud (US)",
+  "ap-south-1": "Asia Pacific (Mumbai)",
+  "ap-northeast-2": "Asia Pacific (Seoul)",
+  "ap-southeast-1": "Asia Pacific (Singapore)",
+  "ap-southeast-2": "Asia Pacific (Sydney)",
+  "ap-northeast-1": "Asia Pacific (Tokyo)",
+  "ca-central-1": "Canada (Central)",
+  "eu-central-1": "EU (Frankfurt)",
+  "eu-west-1": "EU (Ireland)",
+  "eu-west-2": "EU (London)",
+  "eu-west-3": "EU (Paris)",
+  "sa-east-1": "South America (Sao Paulo)",
+  "us-east-1": "US East (N. Virginia)",
+  "us-east-2": "US East (Ohio)",
+  "us-west-1": "US West (N. California)",
+  "us-west-2": "US West (Oregon)",
+}.freeze
+
+def stringify_keys(hash)
+  hash.collect {|k, v| [k.to_s, v]}.to_h
+end
+
+def get_time_range(days_ago = 1, days = 1)
+  now = Time.now
+  start_date = now - (24 * days_ago * 3600)
+  end_date = start_date + days * 86400
+
+  [start_date.strftime('%Y-%m-%d'),
+   end_date.strftime('%Y-%m-%d')]
+end
+
+def wait_for_confirm
+  puts
+  printf 'Confirm [y/n]> '
+  input = $stdin.gets
+  puts
+
+  input.chomp!
+  return input == 'y' || input == 'Y'
+end
+
+def wait_until_done
+  sleep_time = 0.5
+  start_time = Time.now
+
+  loop do
+    result = yield
+    if result[0] == result[1]
+      break
+    end
+
+    puts '[%3.0f%%] Sleeping %2.1f secs...been waiting %d seconds' %
+             [Float(result[0]) * 100.0 / Float(result[1]), sleep_time, Time.now - start_time]
+    sleep(sleep_time)
+
+    if sleep_time < 10
+      sleep_time *= 2.0
+    end
+  end
+
+  puts '...done'
+end
+
+def wait_until_rimod_done(ec2, ri_mod_ids)
+  puts 'Waiting until modifications are complete'
+
+  wait_until_done do
+    resp = ec2.describe_reserved_instances_modifications({reserved_instances_modification_ids: ri_mod_ids})
+
+    status = resp.reserved_instances_modifications.map {|mod| mod.status}
+
+    [status.count('fulfilled'), ri_mod_ids.size]
+  end
+end
+
+def wait_until_exchange_done(ec2, exchange_ris)
+  puts 'Waiting until exchange is complete (ie, source RIs are retired)'
+
+  wait_until_done do
+    src_ris = get_reserved_instances(ec2, exchange_ris.map {|ri| ri.reserved_instances_id})
+
+    status = src_ris.map {|ri| ri.state}
+    [status.count('retired'), status.size]
+  end
+end
+
+def check_ri_offering(ri_offerings, ri_dest_inst_type, region = REGION)
+  ri_offering = find_ri_offering(ri_offerings,
+                                 {instance_type: ri_dest_inst_type, region: region})
+  unless ri_offering
+    raise "No RI offering matching #{ri_dest_inst_type}"
+  end
+end
+
+def blank?(var)
+  var.nil? || var == ''
+end
+
+def make_inst_type(inst_class, inst_size)
+  [inst_class, inst_size].join('.')
+end
+
+def is_vpc_only(ec2)
+  resp = ec2.describe_account_attributes
+
+  attr = resp.account_attributes.find {|a| a.attribute_name == 'supported-platforms'}
+
+  attr.attribute_values.map {|a| a.attribute_value} == ['VPC']
+end
+
+def find_reserved_instance(ec2, duration, product_description,
+                           instance_type, instance_count)
+  params = {
+    filters: [
+              {
+                name: "state",
+                values: ["active"]
+              },
+              {
+                name: "instance-type",
+                values: [instance_type]
+              },
+              {
+                name: "scope",
+                values: ["Region"]
+              },
+              {
+                name: "duration",
+                values: [duration.to_s]
+              },
+              {
+                name: "product-description",
+                values: [product_description]
+              }
+             ]
+  }
+
+  lookup_ris = ec2.describe_reserved_instances(params).reserved_instances
+
+  if lookup_ris.empty?
+    raise "Could not find instances matching: #{instance_type} #{instance_count}"
+  end
+
+  # descending sort on start time
+  lookup_ris.sort!{|a, b| b.start <=> a.start}
+
+  lookup_ris.select{|a| a.instance_count == instance_count}.first
+end
+
+def get_reserved_instances(ec2, ri_instance_ids)
+  params = {
+      reserved_instances_ids: ri_instance_ids
+  }
+  resp = ec2.describe_reserved_instances(params)
+  unless resp.reserved_instances.size == ri_instance_ids.size
+    raise "Unexpected resp: #{resp.inspect}"
+  end
+
+  resp.reserved_instances
+end
+
+def load_on_demand_pricing_instance(pricing, ri_region, instance_type)
+  filters = {
+    ServiceCode: "AmazonEC2",
+    instanceType: instance_type,
+    location: REGION_LOC_MAP[ri_region.to_sym],
+    operatingSystem: "Linux",
+    preInstalledSw: "NA",
+    tenancy: "Shared",
+    termType: "OnDemand",
+    capacitystatus: "Used",
+  }
+
+  params = {
+    service_code: "AmazonEC2",
+    format_version: "aws_v1",
+    filters: []
+  }
+
+  filters.each do |k, v|
+    params[:filters] << {
+      field: k.to_s,
+      type: "TERM_MATCH",
+      value: v.to_s
+    }
+  end
+
+  resp = pricing.get_products(params)
+  if resp.price_list.empty?
+    return nil
+  end
+
+  if resp.price_list.size != 1
+    raise "Unexpected number of products: #{resp.inspect}"
+  end
+
+  product = JSON.parse(resp.price_list.first)
+  attrs = product['product']['attributes']
+  on_demand_terms = product['terms']['OnDemand'].first.last
+
+  return {
+    region: ri_region,
+    location: attrs['location'],
+    instance_type: attrs['instanceType'],
+    instance_family: inst_type_to_family(attrs['instanceType']),
+    termType: filters[:termType],
+    sku: on_demand_terms['sku'],
+    offer_term_code: on_demand_terms['offerTermCode'],
+    unit: on_demand_terms['priceDimensions'].first.last['unit'],
+    unit_price: Float(on_demand_terms['priceDimensions'].first.last['pricePerUnit']['USD'])
+  }
+end
+
+def load_on_demand_pricing(pricing, ri_region)
+  on_demand_pricing = []
+
+  INST_CLASS_TYPES.each do |inst|
+    # t2 only one different...
+    inst_size = inst == 't2' ? 'nano' : INST_SIZE
+
+    price = load_on_demand_pricing_instance(pricing, ri_region, make_inst_type(inst, inst_size))
+    on_demand_pricing << price if price
+  end
+
+  on_demand_pricing
+end
+
+def ec2_load_ri_offering(ec2, ri_region, inst_class, inst_size)
+  instance_type = make_inst_type(inst_class, inst_size)
+
+  params = {
+      include_marketplace: false,
+      instance_type: instance_type,
+      offering_class: 'convertible',
+      product_description: 'Linux/UNIX (Amazon VPC)',
+      offering_type: 'All Upfront',
+      instance_tenancy: 'default',
+      filters: [
+          {name: 'scope', values: ['Region']},
+          {name: 'duration', values: ['94608000']}
+      ]
+  }
+  resp = ec2.describe_reserved_instances_offerings(params)
+
+  if !resp || resp.reserved_instances_offerings.empty?
+    puts "No reserved instance offerings found for #{instance_type}"
+    return nil
+  end
+
+  if resp.reserved_instances_offerings.size > 1
+    offer_ids = resp.reserved_instances_offerings.map {|offer| offer.reserved_instances_offering_id}
+    puts "WARN: Multiple RI offerings for #{instance_type}: #{offer_ids.inspect}"
+  end
+
+  offering = resp.reserved_instances_offerings.first
+
+  #pp offering
+
+  {
+    instance_type: offering.instance_type,
+    instance_class: inst_class,
+    instance_size: inst_size,
+    fixed_price: offering.fixed_price,
+    usage_price: offering.usage_price,
+    duration: offering.duration,
+    offering_id: offering.reserved_instances_offering_id,
+    offering_class: offering.offering_class,
+    offering_type: offering.offering_type,
+    scope: offering.scope,
+    region: ri_region
+  }
+end
+
+def ec2_load_ri_offerings(ec2, ri_region)
+  offerings = []
+  INST_CLASS_TYPES.each do |inst|
+    # t2 only one different...
+    inst_size = inst == 't2' ? 'nano' : INST_SIZE
+
+    if offering = ec2_load_ri_offering(ec2, ri_region, inst, inst_size)
+      offerings << offering
+    end
+  end
+
+  offerings
+end
+
+def load_ri_offerings(ec2, ri_region)
+  filename = '%s-region=%s.yml' % [RI_OFFERINGS_FILE, ri_region]
+
+  if File.exist?(filename)
+    YAML.load(File.read(filename))
+  else
+    offerings = ec2_load_ri_offerings(ec2, ri_region)
+
+    File.write(filename, YAML.dump(offerings))
+    offerings
+  end
+end
+
+def find_ri_offering(offerings, opts)
+  offerings.each do |offering|
+    allmatch = true
+    opts.each_pair do |k, v|
+      if offering[k] != v
+        allmatch = false
+        break
+      end
+    end
+
+    if allmatch
+      return offering
+    end
+  end
+
+  nil
+end
+
+def dump_table(sums)
+  sums.each.with_index {|row, sum| puts "#{sum}: #{row.inspect}"}
+end
+
+def subset_sum(set, sum)
+  size = set.size
+  sums = (0..sum).map do |i|
+    (0..size).map do |j|
+      nil
+    end
+  end
+  0.upto(size) {|j| sums[0][j] = []} # solution is sum of empty array
+  1.upto(sum) {|i| sums[i][0] = false}
+
+  1.upto(sum) do |i|
+    1.upto(size) do |j|
+      sums[i][j] =
+          if sums[i][j - 1]
+            sums[i][j - 1]
+          else
+            false
+          end
+      element = set[j - 1]
+      r = i - element
+      if r >= 0
+        sums[i][j] =
+            if sums[i][j]
+              sums[i][j]
+            else
+              subset_solution = sums[r][j - 1]
+              if subset_solution
+                subset_solution + [element]
+              else
+                false
+              end
+            end
+      end
+    end
+  end
+
+  # dump_table sums
+
+  sums[sum][size]
+end
+
+# https://gist.github.com/joeyates/d98835b9edc1358b8316db4aa7e7f651
+def build_subset_sums(total)
+  values = []
+
+  values << 1
+
+  begin
+    sum = values.inject(0, :+)
+    last = values.last
+
+    if sum + (last * 2) <= total
+      values << (last * 2)
+    else
+      values << (total - sum)
+    end
+  end while values.inject(0, :+) < total
+
+  1.upto(total) do |i|
+    r = subset_sum(values, i)
+    sum = r.inject(0, :+)
+    if !r || r.empty? || sum != i
+      puts "Could not solve subset sums with #{values.inspect} and sum #{i}, got: #{r.inspect}"
+      return nil
+    end
+  end
+
+  # XXX: if we can't calculate a subset sum, split largest value and
+  # continue
+  values
+end
+
+def get_subset_sums(total)
+  subset_sums = {}
+  if File.exist?(SUBSET_SUMS_FILE)
+    subset_sums = YAML.load(File.read(SUBSET_SUMS_FILE))
+  end
+
+  if subset_sums[total]
+    return subset_sums[total]
+  end
+
+  r = build_subset_sums(total)
+  return nil unless r
+
+  subset_sums[total] = r
+
+  File.write(SUBSET_SUMS_FILE, YAML::dump(subset_sums))
+
+  return r
+end
+
+def build_target_config_params(params)
+  {
+      availability_zone: nil,
+      instance_count: params[:instance_count],
+      instance_type: params[:instance_type],
+      scope: params[:scope],
+      platform: 'EC2-VPC' # XXX: configurable?
+  }
+end
+
+def build_target_config(ri, count)
+  build_target_config_params({
+                                 instance_count: count,
+                                 instance_type: ri.instance_type,
+                                 scope: ri.scope
+                             })
+end
+
+def ri_split(ec2, ri_instance_id)
+  params = {
+      reserved_instances_ids: [ri_instance_id]
+  }
+  resp = ec2.describe_reserved_instances(params)
+  unless resp.reserved_instances.size == 1
+    raise "Unexpected resp: #{resp.inspect}"
+  end
+
+  ri = resp.reserved_instances.first
+
+  subset_sums = get_subset_sums(ri.instance_count)
+  unless subset_sums
+    raise "Unable to find subset sums for instance count: #{ri.instance_count}"
+  end
+
+  subset_sums.sort!
+
+  puts "Instance count: #{ri.instance_count}, got subset sums: #{subset_sums.inspect}"
+
+  client_token = SecureRandom.uuid
+
+  modify_params = {
+      reserved_instances_ids: [ri_instance_id],
+      client_token: client_token,
+      target_configurations: []
+  }
+
+  subset_sums.each do |count|
+    modify_params[:target_configurations] << build_target_config(ri, count)
+  end
+
+  resp = ec2.modify_reserved_instances(modify_params)
+
+  mod_ids = [resp.reserved_instances_modification_id]
+  wait_until_rimod_done(ec2, mod_ids)
+
+  ec2.describe_reserved_instances_modifications({reserved_instances_modification_ids: mod_ids})
+end
+
+def do_ri_split(ec2, ri_instance_id)
+  resp = ri_split(ec2, ri_instance_id)
+
+  pp resp
+end
+
+def do_ri_modify_status(ec2, ri_instance_modify_id)
+  resp = ec2.describe_reserved_instances_modifications({reserved_instances_modification_ids: [ri_instance_modify_id]})
+
+  puts 'STATUS: '
+  puts resp.reserved_instances_modifications.map {|mod| mod.status}.join(', ')
+end
+
+def build_exchange_params(ri_offerings, source_ris, ri_dest_inst_type, ri_region, dry_run = false)
+  ri_offering = find_ri_offering(ri_offerings,
+                                 {instance_type: ri_dest_inst_type, region: ri_region})
+  unless ri_offering
+    raise "No RI offering matching #{ri_dest_inst_type}"
+  end
+
+  params = {
+      dry_run: dry_run,
+      reserved_instance_ids: source_ris.map {|offering| offering.reserved_instances_id},
+      target_configurations: [{
+                                  offering_id: ri_offering[:offering_id]
+                              }]
+  }
+end
+
+def get_ri_exchange_quote(ec2, ri_offerings, source_ris, ri_dest_inst_type, ri_region)
+  params = build_exchange_params(ri_offerings, source_ris, ri_dest_inst_type, ri_region)
+
+  resp = ec2.get_reserved_instances_exchange_quote(params)
+  if !resp || !resp.is_valid_exchange
+    raise "Invalid exchange: #{params}: #{resp}"
+  end
+
+  resp
+end
+
+def accept_ri_exchange_quote(ec2, ri_offerings, source_ris, ri_dest_inst_type, ri_region)
+  params = build_exchange_params(ri_offerings, source_ris, ri_dest_inst_type, ri_region)
+
+  resp = ec2.accept_reserved_instances_exchange_quote(params)
+  if !resp
+    raise "Invalid accept_reserved_instances_exchange_quote: #{params}: #{resp}"
+  end
+
+  resp
+end
+
+def list_reserved_instances(ec2, filters)
+  params = {
+      filters: [{
+                    name: 'duration',
+                    values: ['94608000']
+                },
+                {
+                    name: 'state',
+                    values: ['active']
+                }
+      ],
+      offering_class: 'convertible',
+      offering_type: 'All Upfront'
+  }
+
+  filters.each do |k, v|
+    values = v.is_a?(Array) ? v : [v]
+    params[:filters] << {
+        name: k.to_s,
+        values: values
+    }
+  end
+
+  resp = ec2.describe_reserved_instances(params)
+  unless resp
+    raise 'Failed to describe RIs'
+  end
+
+  resp
+end
+
+def do_ri_exchange(ec2,
+                   ri_offerings,
+                   ri_source_id,
+                   ri_dest_inst_count,
+                   ri_dest_inst_type,
+                   convert_to_base)
+
+  if convert_to_base
+    src_ec2nf = inst_type_to_nf(ri_dest_inst_type)
+
+    inst_class = inst_type_to_family(ri_dest_inst_type)
+    inst_size = inst_class_to_base_size(inst_class)
+
+    ec2nf_mult = src_ec2nf / inst_size_to_nf(inst_size)
+
+    new_dest_inst_count = Integer(Float(ri_dest_inst_count) * ec2nf_mult)
+    new_dest_inst_type = make_inst_type(inst_class, inst_size)
+
+    puts 'Converted %d %s -> %d %s' %
+             [ri_dest_inst_count, ri_dest_inst_type, new_dest_inst_count, new_dest_inst_type]
+
+    ri_dest_inst_count = new_dest_inst_count
+    ri_dest_inst_type = new_dest_inst_type
+  end
+
+  #
+  # Check that there is a matching offering
+  #
+  check_ri_offering(ri_offerings, ri_dest_inst_type)
+
+  source_ri = get_reserved_instances(ec2, [ri_source_id]).first
+  ri_source_inst_type = source_ri.instance_type
+
+  split_results = ri_split(ec2, ri_source_id)
+  unless split_results.reserved_instances_modifications.size == 1
+    raise 'Unexpected number of mods'
+  end
+
+  split_results = split_results.reserved_instances_modifications.first
+  split_ri_ids = split_results.modification_results.map {|mr| mr.reserved_instances_id}
+
+  split_ris = get_reserved_instances(ec2, split_ri_ids)
+
+  ris = {}
+  split_ris.each do |reserved_instance|
+    if ris[reserved_instance.instance_count]
+      raise 'Found two RIs with same instance count'
+    end
+
+    ris[reserved_instance.instance_count] = reserved_instance
+  end
+
+  total_ri_count = ris.keys.inject(0, :+)
+  subset_sums = get_subset_sums(total_ri_count)
+  #puts "total ri count: #{total_ri_count}, subset sums: #{subset_sums}"
+
+  subset_sums.each do |i|
+    unless ris[i]
+      raise "No RI count for subset sum #{i}"
+    end
+  end
+
+  subset_sums.sort!
+
+  puts
+
+  # Binary search the subset sums!
+  first = 1
+  last = total_ri_count
+
+  exceeded_instance_count = false
+  last_quote = nil
+  while first <= last
+    count = (first + last) / 2
+
+    sums = subset_sum(subset_sums, count)
+
+    selected_ris = ris.select {|k| sums.include?(k)}.values
+    quote = get_ri_exchange_quote(ec2, ri_offerings, selected_ris, ri_dest_inst_type, REGION)
+
+    target_res_value = quote.target_configuration_value_set.first
+    curr_quote = {
+        source_instance_count: count,
+        source_instance_type: ri_source_inst_type,
+        source_subset_sums: sums,
+        target_instance_count: target_res_value.target_configuration.instance_count,
+        target_instance_type: ri_dest_inst_type,
+        target_offering_id: target_res_value.target_configuration.offering_id,
+        payment_due: quote.payment_due,
+        selected_ris: selected_ris
+    }
+
+    puts 'For %d %s can get %d %s for price %4.2f: %s' %
+             [count, ri_source_inst_type, curr_quote[:target_instance_count],
+              ri_dest_inst_type, curr_quote[:payment_due], curr_quote[:target_offering_id]]
+
+    if curr_quote[:target_instance_count] == ri_dest_inst_count
+      last_quote = curr_quote
+    end
+
+    if curr_quote[:target_instance_count] > ri_dest_inst_count
+      exceeded_instance_count = true
+    end
+
+    if curr_quote[:target_instance_count] <= ri_dest_inst_count
+      first = count + 1
+    else
+      last = count - 1
+    end
+  end
+
+  if last_quote && exceeded_instance_count
+    puts
+    puts 'Best matching quote:'
+    puts
+    puts " Source instances:\t#{last_quote[:source_instance_count]} #{last_quote[:source_instance_type]}"
+    puts " Destination instances:\t#{last_quote[:target_instance_count]} #{last_quote[:target_instance_type]}"
+    puts " Source subsets:\t#{last_quote[:source_subset_sums]}"
+    puts " Source RI IDS:\t\t#{last_quote[:selected_ris].map {|ri| ri.reserved_instances_id}.join(", ")}"
+    puts " Exchange cost:\t\t$#{last_quote[:payment_due]}"
+    puts
+  elsif !exceeded_instance_count
+    puts 'Can not verify matched quote is optimal'
+    return
+  else
+    puts 'NO MATCH FOUND FOR EXCHANGE'
+    return
+  end
+
+  confirm = wait_for_confirm
+
+  if confirm
+    puts 'Accepting the exchange...'
+
+    resp = accept_ri_exchange_quote(ec2, ri_offerings, last_quote[:selected_ris], ri_dest_inst_type, REGION)
+    unless resp.exchange_id
+      raise "Exchange failed, resp: #{resp.inspect}"
+    end
+
+    wait_until_exchange_done(ec2, last_quote[:selected_ris])
+
+    # Remove the source RIs
+    last_quote[:source_subset_sums].each do |sub_sum|
+      ris.delete(sub_sum)
+    end
+
+
+  else
+    puts 'No exchange made.'
+  end
+
+  if ris.empty?
+    puts 'No more remaining RIs'
+    return
+  end
+
+  puts
+  puts 'Recombining remaining RIs into a single RI'
+
+  total_recombine_count = ris.keys.inject(0, :+)
+
+  modify_params = {
+      reserved_instances_ids: ris.values.map {|ri| ri.reserved_instances_id},
+      client_token: SecureRandom.uuid,
+      target_configurations: []
+  }
+
+  modify_params[:target_configurations] << build_target_config(ris.values.first, total_recombine_count)
+
+  resp = ec2.modify_reserved_instances(modify_params)
+
+  mod_ids = [resp.reserved_instances_modification_id]
+  wait_until_rimod_done(ec2, mod_ids)
+
+  resp = ec2.describe_reserved_instances_modifications({reserved_instances_modification_ids: mod_ids})
+  if resp.reserved_instances_modifications.size != mod_ids.size
+    raise "Unexpected number of results: #{resp.reserved_instances_modifications.inspect}"
+  end
+
+  mod_results = resp.reserved_instances_modifications.first
+  new_ri = mod_results.modification_results.first
+
+  puts
+  puts 'Remaining RI: %d %s (ID: %s)' %
+           [new_ri.target_configuration.instance_count, new_ri.target_configuration.instance_type,
+            new_ri.reserved_instances_id]
+end
+
+def inst_type_to_family(instance_type)
+  instance_type.split('.').first
+end
+
+# https://aws.amazon.com/blogs/aws/new-instance-size-flexibility-for-ec2-reserved-instances/
+def inst_type_to_nf(instance_type)
+  inst_size_to_nf(instance_type.split('.').last)
+end
+
+def inst_size_to_nf(instance_size)
+  ec2nf = case instance_size
+          when 'nano'
+            0.25
+          when 'micro'
+            0.5
+          when 'small'
+            1
+          when 'medium'
+            2
+          when 'large'
+            4
+          when 'xlarge'
+            8
+          when '2xlarge'
+            16
+          when '4xlarge'
+            32
+          when '8xlarge'
+            64
+          when '10xlarge'
+            80
+          when '16xlarge'
+            128
+          when '32xlarge'
+            256
+          else
+            raise "Unknown instance size: #{instance_size}"
+          end
+  Float(ec2nf)
+end
+
+def ec2nf_to_optimal_size(ec2nf)
+  # Prefer large
+  if ec2nf % 4.0 == 0.0
+    return 'large'
+  end
+
+  # Use nano < small
+  if ec2nf % 1.0 != 0.0
+    return 'nano'
+  end
+
+  if ec2nf % 2.0 == 0.0
+    return 'medium'
+  end
+
+  return 'small'
+end
+
+def inst_class_to_base_size(inst_class)
+  if inst_class == 't2'
+    'nano'
+  else
+    'large'
+  end
+end
+
+def do_ri_join(ec2, ri_source_inst_type, join_all, ri_join_skip)
+  skip_classes = {}
+  unless blank?(ri_join_skip)
+    ri_join_skip.split(",").each do |kls|
+      skip_classes[kls] = true
+    end
+  end
+
+  filter_ops = {
+      'scope': 'Region'
+  }
+  unless join_all
+    filter_ops['instance-type'] = ri_source_inst_type
+  end
+  resp = list_reserved_instances(ec2, filter_ops)
+
+  inst_groups = {}
+  resp.reserved_instances.each do |reserved_instance|
+    family = inst_type_to_family(reserved_instance.instance_type)
+    ec2nf = inst_type_to_nf(reserved_instance.instance_type)
+    key = "#{family}::#{reserved_instance.end}::#{reserved_instance.product_description}"
+
+    if skip_classes[family]
+      next
+    end
+
+    group = inst_groups[key]
+    if group.nil?
+      group = {
+          family: family,
+          count: 0,
+          ec2nf: 0.0,
+          reserved_instances: [],
+          end_date: reserved_instance.end,
+          product_description: reserved_instance.product_description,
+      }
+      inst_groups[key] = group
+    end
+
+    group[:count] += 1
+    group[:ec2nf] += (ec2nf * Float(reserved_instance.instance_count))
+    group[:reserved_instances] << {
+        instance_count: reserved_instance.instance_count,
+        instance_type: reserved_instance.instance_type,
+        reserved_instances_id: reserved_instance.reserved_instances_id,
+    }
+  end
+
+  vpc_only = is_vpc_only(ec2)
+
+  puts 'Converting the following reserved instances:'
+  puts ''
+  inst_groups.each do |k, group|
+    # t2.nano is our conversion size
+    if group[:family] == 't2'
+      group[:preferred_size] = 'nano'
+    else
+      group[:preferred_size] = ec2nf_to_optimal_size(group[:ec2nf])
+    end
+
+    group[:dest_instance_type] = make_inst_type(group[:family], group[:preferred_size])
+
+    # Don't convert if no change in size or type
+    if group[:count] == 1 &&
+        group[:reserved_instances].first[:instance_type] == group[:dest_instance_type]
+      group[:no_convert] = true
+    end
+
+    unless group[:no_convert]
+      group[:reserved_instances].each do |src_ri|
+        puts '%5d %-*s %s, RI: %s' %
+                 [src_ri[:instance_count],
+                  10, src_ri[:instance_type],
+                  group[:end_date],
+                  src_ri[:reserved_instances_id]]
+      end
+      puts ''
+    end
+  end
+  puts ''
+
+  to_convert = 0
+  puts 'Into the following RIs:'
+  puts ''
+  inst_groups.each do |k, group|
+    next if group[:no_convert]
+
+    to_convert += 1
+    puts '%5d %-*s %s, with product type: %s%s' %
+             [Integer(group[:ec2nf] / inst_size_to_nf(group[:preferred_size])),
+              10, make_inst_type(group[:family], group[:preferred_size]),
+              group[:end_date],
+              group[:product_description],
+              vpc_only ? ' (VPC)' : ''
+             ]
+  end
+
+  if to_convert == 0
+    puts 'Nothing to convert, exiting'
+    return
+  end
+
+  confirmed = wait_for_confirm
+
+  unless confirmed
+    puts 'No confirmation, exiting without change'
+    return
+  end
+
+  mod_ids = []
+  inst_groups.each do |k, group|
+    next if group[:no_convert]
+
+    client_token = SecureRandom.uuid
+
+    if vpc_only || group[:product_description].include?('VPC')
+      platform = 'EC2-VPC'
+    else
+      platform = 'EC2-Classic'
+    end
+
+    target_count = Integer(group[:ec2nf] / inst_size_to_nf(group[:preferred_size]))
+
+    params = {
+        reserved_instances_ids: group[:reserved_instances].map {|ri| ri[:reserved_instances_id]},
+        client_token: client_token,
+        target_configurations: [
+            {
+                availability_zone: nil,
+                instance_count: target_count,
+                instance_type: make_inst_type(group[:family], group[:preferred_size]),
+                platform: platform,
+                scope: 'Region'
+            }
+        ]
+    }
+
+    resp = ec2.modify_reserved_instances(params)
+
+    mod_ids << resp.reserved_instances_modification_id
+  end
+
+  unless mod_ids.empty?
+    wait_until_rimod_done(ec2, mod_ids)
+  end
+end
+
+def print_ri(attrs, util, covered_hours)
+  puts '%14s %32s %-10s %8s (%4d) percent=%5.1f purchased_hours=%5d used_hours=%7.1f unused_hours=%6.1f unused_instances=%4.1f' %
+           [attrs['accountId'], attrs['accountName'], attrs['instanceType'],
+            attrs['region'], Integer(attrs['numberOfInstances']),
+            Float(util['utilization_percentage']),
+            Integer(util['purchased_hours']),
+            Float(util['total_actual_hours']),
+            Float(util['unused_hours']),
+            Float(util['unused_hours']) / Float(covered_hours)
+           ]
+end
+
+def do_ri_utilization(costexplorer, output_file)
+  days = 1
+  time_period = get_time_range(3, days)
+
+  params = {
+      time_period: {
+          :start => time_period[0],
+          :end => time_period[1]
+      },
+      group_by: [
+          {
+              type: 'DIMENSION',
+              key: 'SUBSCRIPTION_ID'
+          }
+      ],
+      filter: {
+          dimensions: {
+              key: 'SERVICE',
+              values: ['Amazon Elastic Compute Cloud - Compute']
+          }
+      }
+  }
+
+  resp = costexplorer.get_reservation_utilization(params)
+
+  sorted_groups = resp.utilizations_by_time.first.groups.sort {|a, b|
+    Float(a.utilization['utilization_percentage']) <=> Float(b.utilization['utilization_percentage'])
+  }
+
+  if !blank?(output_file)
+    yaml = []
+
+    sorted_groups.each do |group|
+      attrs = group.attributes
+      util = group.utilization
+
+      yaml << {
+          attributes: stringify_keys(attrs.to_h),
+          utilization: stringify_keys(util.to_h),
+          coverage_hours: days * 24
+      }
+    end
+
+    File.write(output_file, YAML::dump(yaml))
+    return
+  end
+
+  puts 'Convertible RI Utilization:'
+  puts
+
+  sorted_groups.each do |group|
+    attrs = group.attributes
+    util = group.utilization
+
+    next if attrs['offeringType'] != 'Convertible'
+
+    begin
+      print_ri(attrs, util, days * 24)
+        #pp group
+    rescue => e
+      puts "Couldn't parse: #{e.inspect}"
+      pp group
+      break
+    end
+  end
+
+end
+
+def do_ri_coverage(costexplorer)
+  time_period = get_time_range(3)
+
+  params = {
+      time_period: {
+          start: time_period[0],
+          end: time_period[1]
+      },
+      group_by: [
+          {
+              type: 'DIMENSION',
+              key: 'REGION'
+          },
+          {
+              type: 'DIMENSION',
+              key: 'LINKED_ACCOUNT'
+          },
+          {
+              type: 'DIMENSION',
+              key: 'INSTANCE_TYPE'
+          }],
+      filter: {
+          dimensions: {
+              key: 'SERVICE',
+              values: ['Amazon Elastic Compute Cloud - Compute']
+          }
+      }
+  }
+
+  resp = costexplorer.get_reservation_coverage(params)
+
+  unless resp.next_page_token.nil?
+    raise 'need paging'
+  end
+
+  puts "Undercovered instances between #{time_period[0]}..#{time_period[1]}:"
+
+  groups = resp.coverages_by_time.first.groups
+  groups.sort! {|a, b|
+    Float(a.coverage.coverage_hours.coverage_hours_percentage) <=> Float(b.coverage.coverage_hours.coverage_hours_percentage)
+  }
+  resp.coverages_by_time.first.groups.each do |group|
+    coverage = Float(group.coverage.coverage_hours.coverage_hours_percentage)
+
+    next unless coverage < 100.0
+
+    puts "%s\t%s\t%s\t\ton_demand_hours=%s,reserved_hours=%s,total_running_hours=%s,coverage_hours_percentage=%s" %
+             [group.attributes['linkedAccount'], group.attributes['region'], group.attributes['instanceType'],
+              group.coverage.coverage_hours.on_demand_hours,
+              group.coverage.coverage_hours.reserved_hours,
+              group.coverage.coverage_hours.total_running_hours,
+              group.coverage.coverage_hours.coverage_hours_percentage]
+  end
+end
+
+def do_ri_make_regional(ec2)
+  filters = {
+      scope: 'Availability Zone'
+  }
+  resp = list_reserved_instances(ec2, filters)
+
+  vpc_only = is_vpc_only(ec2)
+
+  resp.reserved_instances.each do |reserved_instance|
+    if vpc_only || reserved_instance.product_description.include?('VPC')
+      platform = 'EC2-VPC'
+    else
+      platform = 'EC2-Classic'
+    end
+
+    params = {
+        reserved_instances_ids: [reserved_instance.reserved_instances_id],
+        client_token: SecureRandom.uuid,
+        target_configurations: [
+            {
+                availability_zone: nil,
+                instance_count: reserved_instance.instance_count,
+                instance_type: reserved_instance.instance_type,
+                platform: platform,
+                scope: 'Region'
+            }
+        ]
+    }
+
+    resp = ec2.modify_reserved_instances(params)
+
+    puts "RI instance modification status ID: #{resp.reserved_instances_modification_id}"
+  end
+end
+
+def do_ri_exchange_unused(ec2, ri_offerings, aws_id, ri_util_report, ri_dest_inst_type)
+  check_ri_offering(ri_offerings, ri_dest_inst_type)
+
+  begin
+    ri_util = YAML.load(File.read(ri_util_report))
+  rescue StandardError
+    raise "Unable to read RI util from #{ri_util_report}"
+  end
+
+  aws_id = Integer(aws_id)
+
+  # First select only the RIs we can convert
+  ris = ri_util.select! {|ri|
+    aws_id == Integer(ri[:attributes]['accountId']) &&
+        'Convertible' == ri[:attributes]['offeringType'] &&
+        REGION == ri[:attributes]['region']
+  }
+
+  # Second, filter instances that have unused instance hours we can
+  # use (could be done with single pass, but clearer as two
+  ris = ri_util.select! {|ri|
+    unused_instances = Float(ri[:utilization]['unused_hours']) / Float(ri[:coverage_hours])
+    ri[:unused_instances] = Integer(unused_instances)
+
+    raise 'FIXME: full RI depletion' if ri[:unused_instances] >= Integer(ri[:attributes]['numberOfInstances'])
+
+    ri[:unused_instances] >= 1
+  }
+
+  puts 'Exchanging the following RIs:'
+  puts
+  ris.each do |ri|
+    # Ensure the RIs actually exist (this will error if no response)
+    get_reserved_instances(ec2, [ri[:attributes]['leaseId']])
+
+    hours_left = Float(ri[:utilization]['purchased_hours']) - Float(ri[:unused_instances] * ri[:coverage_hours])
+    puts '%-38s %10s util_percent=%5.1f unused_instances=%3d (leaves %d hours, %d instances)' %
+             [ri[:attributes]['leaseId'], ri[:attributes]['instanceType'],
+              Float(ri[:utilization]['utilization_percentage']), ri[:unused_instances],
+              hours_left,
+              Integer(ri[:attributes]['numberOfInstances']) - ri[:unused_instances]]
+  end
+  puts
+
+  confirm = wait_for_confirm
+  unless confirm
+    puts 'Exiting'
+    return
+  end
+
+  # Next step: split all RIs to the keeping portion and the exchange
+  # portion
+  ris.each do |ri|
+    params = {
+        reserved_instances_ids: [ri[:attributes]['leaseId']],
+        client_token: SecureRandom.uuid,
+        target_configurations: []
+    }
+
+    # Split into used/unused RIs
+    target_params = {
+        instance_count: ri[:unused_instances],
+        instance_type: ri[:attributes]['instanceType'],
+        scope: ri[:attributes]['scope']
+    }
+    params[:target_configurations] << build_target_config_params(target_params)
+
+    target_params = {
+        instance_count: Integer(ri[:attributes]['numberOfInstances']) - ri[:unused_instances],
+        instance_type: ri[:attributes]['instanceType'],
+        scope: ri[:attributes]['scope']
+    }
+    params[:target_configurations] << build_target_config_params(target_params)
+
+    ri[:modify_params] = params
+  end
+
+  ris.each do |ri|
+    resp = ec2.modify_reserved_instances(ri[:modify_params])
+    raise 'Failed to modify' unless resp
+
+    ri[:modify_resp] = resp
+  end
+
+  mod_ids = ris.map {|ri| ri[:modify_resp].reserved_instances_modification_id}
+  wait_until_rimod_done(ec2, mod_ids)
+
+  #
+  # Lookup the modification details so that we can grab RI IDs
+  #
+  ris.each do |ri|
+    params = {reserved_instances_modification_ids: [ri[:modify_resp].reserved_instances_modification_id]}
+    resp = ec2.describe_reserved_instances_modifications(params)
+
+    ri[:modify_result] = resp.reserved_instances_modifications.first
+  end
+
+  #
+  # Grab a quote to exchange all excess RIs to destination instance type.
+  #
+
+  exchange_ris = []
+
+  ris.each do |ri|
+    unused_ri_mod = ri[:modify_result].modification_results
+                        .find {|res| res.target_configuration.instance_count == ri[:unused_instances]}
+    unless unused_ri_mod
+      raise "Could not find #{ri[:unused_instances]} in #{mod_results.inspect}"
+    end
+
+    # If we are already at our instance type, don't need to exchange
+    if unused_ri_mod.target_configuration.instance_type == ri_dest_inst_type
+      #puts "DEBUG: Skipping #{unused_ri_mod.target_configuration.inspect}"
+      next
+    end
+
+    unused_ri = get_reserved_instances(ec2, [unused_ri_mod.reserved_instances_id]).first
+    unless unused_ri
+      raise 'Unable to find RI'
+    end
+
+    ri[:exchanging] = true
+    ri[:unused_ri] = unused_ri
+
+    exchange_ris << unused_ri
+  end
+
+  if exchange_ris.empty?
+    puts 'Nothing to exchange..exiting'
+    return
+  end
+
+  exchange_quote = get_ri_exchange_quote(ec2, ri_offerings, exchange_ris, ri_dest_inst_type, REGION)
+
+  #
+  # Print exchange quotes, wait for confirm
+  #
+  puts 'Exchanging the following:'
+  puts
+
+  ris.each do |ri|
+    next unless ri[:exchanging]
+
+    puts '%5d %-10s (%s)' %
+             [ri[:unused_ri].instance_count,
+              ri[:unused_ri].instance_type,
+              ri[:unused_ri].reserved_instances_id]
+  end
+
+  target_config = exchange_quote.target_configuration_value_set.first
+
+  puts
+  puts 'For: %5d %-10s for total cost: $%7.2f' %
+           [target_config.target_configuration.instance_count,
+            ri_dest_inst_type,
+            exchange_quote.payment_due]
+
+  confirm = wait_for_confirm
+  raise 'Exiting' unless confirm
+
+  #
+  # Accept the exchanges
+  #
+
+  accepted_exchange_quote = accept_ri_exchange_quote(ec2, ri_offerings, exchange_ris, ri_dest_inst_type, REGION)
+
+  puts "Exchange RI ID: #{accepted_exchange_quote.exchange_id}"
+
+  wait_until_exchange_done(ec2, exchange_ris)
+end
+
+def get_ri_coverage_ecd_report(ec2, costexplorer, ri_offerings, on_demand_prices, ri_region, time_period)
+  params = {
+    time_period: {
+      :start => time_period[0],
+      :end => time_period[1]
+    },
+    group_by: [
+               {
+                 type: 'DIMENSION',
+                 key: 'REGION'
+               },
+               {
+                 type: 'DIMENSION',
+                 key: 'INSTANCE_TYPE'
+               }],
+    filter: {
+      and: [
+            {
+              dimensions: {
+                key: 'SERVICE',
+                values: ['Amazon Elastic Compute Cloud - Compute']
+              }
+            },
+            {
+              dimensions: {
+                key: 'REGION',
+                values: [ri_region]
+              }
+            },
+            {
+              dimensions: {
+                key: 'PLATFORM',
+                values: ["Linux/UNIX"]
+              }
+            }
+           ]
+    }
+  }
+
+  resp = costexplorer.get_reservation_coverage(params)
+
+  unless resp.next_page_token.nil?
+    raise 'need paging'
+  end
+
+  #pp resp
+
+  range = resp.coverages_by_time.first.time_period
+
+  time_range = Time.parse(range.end) - Time.parse(range.start)
+  hours_spanned = Float(time_range / 3600)
+
+  puts "hours spanned: #{hours_spanned}"
+
+  groups = resp.coverages_by_time.first.groups
+  groups.sort! {|a, b|
+    Float(a.coverage.coverage_hours.coverage_hours_percentage) <=> Float(b.coverage.coverage_hours.coverage_hours_percentage)
+  }
+
+  coverages = []
+
+  resp.coverages_by_time.first.groups.each do |group|
+    coverage_pct = Float(group.coverage.coverage_hours.coverage_hours_percentage)
+    #puts "group: #{group.inspect}"
+
+    coverages << {
+      coverage_percent: coverage_pct,
+      on_demand_hours: Float(group.coverage.coverage_hours.on_demand_hours),
+      on_demand_instances: Float(group.coverage.coverage_hours.on_demand_hours) / hours_spanned,
+      instance_type: group.attributes['instanceType'],
+      region: group.attributes['region']
+    }
+  end
+
+  coverages.keep_if{|cov| cov[:on_demand_instances] >= 1.0 }
+
+  inst_family_coverage = {}
+
+  coverages.each do |coverage|
+    family = inst_type_to_family(coverage[:instance_type])
+    ec2nf = inst_type_to_nf(coverage[:instance_type])
+    ec2nf *= coverage[:on_demand_instances]
+
+    fcov = inst_family_coverage[family]
+    if fcov
+      fcov[:ec2nf] += ec2nf
+    else
+      fcov = {
+        ec2nf: ec2nf,
+        family: family
+      }
+      inst_family_coverage[family] = fcov
+    end
+  end
+
+  ecd_ranked_coverages = []
+  inst_family_coverage.each do |family, cov|
+    on_demand = on_demand_prices.find{|p|
+      p[:region] == ri_region && p[:instance_family] == family
+    }
+    next unless on_demand
+
+    ri_offering = find_ri_offering(ri_offerings,
+                                   {instance_class: family, region: ri_region})
+    next unless ri_offering
+
+    # XXX: assumes unit == hour
+    cov[:on_demand_unit_price] = on_demand[:unit_price]
+    cov[:ri_fixed_price] = ri_offering[:fixed_price]
+    cov[:ri_duration] = ri_offering[:duration]
+    cov[:ri_unit_price] = Float(ri_offering[:fixed_price]) / (Float(ri_offering[:duration]) / 3600.0)
+    cov[:ecd] = 1.0 - (cov[:ri_unit_price] / cov[:on_demand_unit_price])
+
+    ecd_ranked_coverages << cov
+  end
+
+  if ecd_ranked_coverages.empty?
+    puts "No EC2 usage that requires coverage with available RIs"
+    return []
+  end
+
+  # sort by decreasing ecd
+  ecd_ranked_coverages.sort!{|a, b| b[:ecd] <=> a[:ecd]}
+
+  return ecd_ranked_coverages
+end
+
+def get_ri_utilization_report(ec2, costexplorer, ri_offerings, ri_region, time_period)
+  params = {
+    time_period: {
+      :start => time_period[0],
+      :end => time_period[1]
+    },
+    group_by: [
+               {
+                 type: 'DIMENSION',
+                 key: 'SUBSCRIPTION_ID'
+               }
+              ],
+    filter: {
+      and: [
+            {
+              dimensions: {
+                key: 'SERVICE',
+                values: ['Amazon Elastic Compute Cloud - Compute']
+              }
+            },
+            {
+              dimensions: {
+                key: 'REGION',
+                values: [ri_region]
+              }
+            },
+            {
+              dimensions: {
+                key: 'PLATFORM',
+                values: ["Linux/UNIX"]
+              }
+            }
+           ]
+    }
+  }
+
+  resp = costexplorer.get_reservation_utilization(params)
+
+  sorted_groups = resp.utilizations_by_time.first.groups.sort {|a, b|
+    Float(a.utilization['utilization_percentage']) <=> Float(b.utilization['utilization_percentage'])
+  }
+
+  puts 'Convertible RI Utilization:'
+  puts
+
+  sorted_groups.delete_if{|g| g.attributes['offeringType'] != 'Convertible'}
+
+  sorted_groups.map do |ri|
+    {
+      instance_type: ri.attributes['instanceType'],
+      scope: ri.attributes['scope'],
+      lease_id: ri.attributes['leaseId'],
+      number_of_instances: Integer(ri.attributes['numberOfInstances']),
+      start_date: ri.attributes['startDateTime'],
+      end_date: ri.attributes['endDateTime'],
+      util_percent: Float(ri.utilization.utilization_percentage),
+      unused_hours: Float(ri.utilization.unused_hours),
+      purchased_hours: Float(ri.utilization.purchased_hours)
+    }
+  end
+end
+
+def build_ri_model(instance_count:, instance_type:, lease_id:,
+                   unused_instances: nil, number_of_instances: nil,
+                   scope: 'Region')
+  {
+    unused_instances: unused_instances || instance_count,
+    number_of_instances: number_of_instances || instance_count,
+    lease_id: lease_id,
+    instance_type: instance_type,
+    instance_count: instance_count,
+    scope: scope
+  }
+end
+
+def build_ri_model_from_ri(ri)
+  build_ri_model(instance_count: ri.instance_count,
+                 instance_type: ri.instance_type,
+                 lease_id: ri.reserved_instances_id,
+                 scope: ri.scope)
+end
+
+def get_unused_ri_conversion_splits(ec2, checkpointer, coverage_hours, ri_util_s, ri_region)
+
+  ri_util = ri_util_s[:ri_util]
+
+  # this will error if an RI doesn't exist
+  get_reserved_instances(ec2, ri_util.map{|ri| ri[:lease_id]})
+
+  puts 'Exchanging the following RIs:'
+  puts
+  ri_util.each do |ri|
+    hours_left = ri[:purchased_hours] - (ri[:unused_instances] * coverage_hours)
+    puts '%-38s %10s util_percent=%5.1f unused_hours=%5d unused_instances=%3d (leaves %d hours, %d instances)' %
+      [ri[:lease_id], ri[:instance_type],
+       ri[:util_percent], ri[:unused_hours], ri[:unused_instances],
+       hours_left,
+       Integer(ri[:number_of_instances]) - ri[:unused_instances]]
+  end
+  puts
+
+  confirm = wait_for_confirm
+  unless confirm
+    puts 'Exiting'
+    return nil
+  end
+
+  ris_to_join = []
+  ris_to_split = []
+
+  # Next step: split all RIs to the keeping portion and the exchange
+  # portion
+  ri_util.each do |ri|
+    unused_instances = Integer(ri[:unused_instances])
+    number_of_instances = Integer(ri[:number_of_instances])
+
+    if unused_instances > number_of_instances
+      raise "ERROR: more unused than available: #{ri.inspect}"
+    end
+
+    ri_struct = get_reserved_instances(ec2, [ri[:lease_id]]).first
+
+    ri_model = build_ri_model(instance_count: ri_struct.instance_count,
+                              instance_type: ri_struct.instance_type,
+                              lease_id: ri_struct.reserved_instances_id,
+                              unused_instances: unused_instances,
+                              number_of_instances: number_of_instances,
+                              scope: ri_struct.scope)
+
+    if unused_instances == number_of_instances
+      ris_to_join << ri_model
+    else
+      ris_to_split << ri_model
+    end
+  end
+
+  { :ri_joins => ris_to_join,
+    :ri_splits => ris_to_split }
+end
+
+def split_unused_ri_conversions(ec2, checkpointer, coverage_hours, ri_splits_s, ri_region)
+  raise "missing state" if ri_splits_s.empty?
+
+  ris_to_join = ri_splits_s[:ri_joins]
+  ris_to_split = ri_splits_s[:ri_splits]
+
+  split_params = {}
+  ris_to_split.each do |ri|
+    client_token = SecureRandom.uuid
+    params = {
+        reserved_instances_ids: [ri[:lease_id]],
+        client_token: client_token,
+        target_configurations: []
+    }
+
+    # Split into used/unused RIs
+    target_params = {
+        instance_count: ri[:unused_instances],
+        instance_type: ri[:instance_type],
+        scope: ri[:scope]
+    }
+    params[:target_configurations] << build_target_config_params(target_params)
+
+    target_params = {
+        instance_count: ri[:number_of_instances] - ri[:unused_instances],
+        instance_type: ri[:instance_type],
+        scope: ri[:scope]
+    }
+    params[:target_configurations] << build_target_config_params(target_params)
+
+    split_params[client_token] = {
+      ri: ri,
+      params: params
+    }
+  end
+
+  split_params.each do |client_token, splits|
+    resp = ec2.modify_reserved_instances(splits[:params])
+    raise 'Failed to modify' unless resp
+
+    splits[:reserved_instances_modification_id] = resp.reserved_instances_modification_id
+  end
+
+  split_params
+end
+
+def finish_split_unused_ri_conversions(ec2, checkpointer, coverage_hours, ri_splits_s,
+                                       ri_split_results_s, ri_region)
+  raise "missing state" if ri_splits_s.empty?
+
+  ris_to_join = ri_splits_s[:ri_joins]
+  ris_to_split = ri_splits_s[:ri_splits]
+
+  split_results = ri_split_results_s[:results]
+
+  if split_results.empty?
+    puts "Split modifications already processed"
+    return
+  end
+
+  # Wait for all modifications to finish
+  mod_ids = split_results.map {|key, splits| splits[:reserved_instances_modification_id]}
+  wait_until_rimod_done(ec2, mod_ids)
+
+  #
+  # Lookup the modification details so that we can grab RI IDs
+  #
+  unused_ris = []
+  split_results.each do |key, splits|
+    params = {reserved_instances_modification_ids: [splits[:reserved_instances_modification_id]]}
+    resp = ec2.describe_reserved_instances_modifications(params)
+
+    modify_result = resp.reserved_instances_modifications.first
+
+    if modify_result.modification_results.size != 2
+      raise "Unexpected modify result: #{modify_result.inspect}"
+    end
+
+    # Find the unused RI
+    unused_ri = modify_result.modification_results
+      .find {|res| res.target_configuration.instance_count == splits[:ri][:unused_instances]}
+    unless unused_ri
+      raise "Unable to find unused RI: #{modify_result.inspect}"
+    end
+
+    # Add to unused RIs, now unused == number
+    unused_ris << build_ri_model(instance_count: unused_ri.target_configuration.instance_count,
+                                 instance_type: unused_ri.target_configuration.instance_type,
+                                 lease_id: unused_ri.reserved_instances_id,
+                                 scope: unused_ri.target_configuration.scope)
+  end
+
+  #
+  # Now update states
+  #
+
+  ris_to_join += unused_ris
+  ri_splits_s.set({ri_joins: ris_to_join, ri_splits: []})
+
+  ri_split_results_s[:results] = []
+end
+
+def do_ri_join_and_exchange(ec2, ri_offerings, ri_splits_s, ri_region)
+  raise "missing state" if ri_splits_s.empty?
+
+  ri_dest_inst_type = INST_TYPE_BASE
+
+  ris_to_join = ri_splits_s[:ri_joins]
+
+  lease_ids = ris_to_join.map{|ri| ri[:lease_id]}
+
+  ri_list = get_reserved_instances(ec2, lease_ids)
+
+  #
+  # Map the RIs requiring conversion by end date
+  #
+  ri_end_map = {}
+  ri_list.each do |ri|
+    next if ri.instance_type == ri_dest_inst_type
+
+    end_str = ri.end.to_s
+    if ri_end_map[end_str]
+      ri_end_map[end_str] << ri
+    else
+      ri_end_map[end_str] = [ri]
+    end
+  end
+
+  exchange_quotes = []
+  ri_end_map.each do |key, ris|
+    quote = get_ri_exchange_quote(ec2, ri_offerings, ris, ri_dest_inst_type, ri_region)
+
+    exchange_quotes << {
+      :ris => ris,
+      :exchange_quote => quote
+    }
+  end
+
+  ri_end_map = nil
+
+  unless exchange_quotes.empty?
+    puts
+    puts "Exchanging: "
+    puts
+  end
+
+  exchange_quotes.each do |quote|
+    quote[:ris].each do |ri|
+      puts '%5d %-10s (%s)' %
+        [ri.instance_count,
+         ri.instance_type,
+         ri.reserved_instances_id]
+    end
+    target_config = quote[:exchange_quote].target_configuration_value_set.first
+    puts 'For: %5d %-10s for total cost: $%7.2f' %
+      [target_config.target_configuration.instance_count,
+       ri_dest_inst_type,
+       quote[:exchange_quote].payment_due]
+    puts
+  end
+
+  unless exchange_quotes.empty?
+    confirm = wait_for_confirm
+    raise 'Exiting' unless confirm
+  end
+
+  #
+  # Perform the exchanges and remove source RIs from list
+  #
+  exchange_quotes.each do |quote|
+    resp = accept_ri_exchange_quote(ec2, ri_offerings, quote[:ris],
+                                    ri_dest_inst_type, ri_region)
+
+    wait_until_exchange_done(ec2, quote[:ris])
+
+    ri_ids_to_rm = quote[:ris].map{|r| r.reserved_instances_id}
+
+    ris_to_join.delete_if{|r| ri_ids_to_rm.include?(r[:lease_id])}
+
+    first_ri = quote[:ris].first
+    target_config = quote[:exchange_quote].target_configuration_value_set.first
+
+    found_ri = nil
+    wait_until_done do
+      found_ri = find_reserved_instance(ec2, first_ri.duration, first_ri.product_description,
+                                        ri_dest_inst_type, target_config.target_configuration.instance_count)
+      [found_ri.nil? ? 0 : 1, 1]
+    end
+
+    unless found_ri
+      raise "Can not find RI matching #{target_config.inspect}"
+    end
+
+    puts "found RI: "
+    pp found_ri
+
+    ri_model = build_ri_model_from_ri(found_ri)
+
+    ris_to_join << ri_model
+    ri_splits_s[:ri_joins] = ris_to_join
+  end
+
+  exchange_quotes = nil
+
+  #
+  # Take all remaining RIs that should be of the same type
+  # and join them into the smallest number of RIs grouped
+  # by enddate
+  #
+
+  lease_ids = ris_to_join.map{|ri| ri[:lease_id]}
+  ri_list = get_reserved_instances(ec2, lease_ids)
+
+  ri_join_map = {}
+  ri_list.each do |ri|
+    end_str = ri.end.to_s
+    if ri_join_map[end_str]
+      ri_join_map[end_str] << ri
+    else
+      ri_join_map[end_str] = [ri]
+    end
+  end
+
+  ri_join_map.each do |key, ris|
+    next if ris.size == 1
+
+    total_instance_count = ris.map {|ri| ri.instance_count}.inject(:+)
+    client_token = SecureRandom.uuid
+
+    if ris.first.product_description.include?('VPC')
+      platform = 'EC2-VPC'
+    else
+      platform = 'EC2-Classic'
+    end
+
+    params = {
+      reserved_instances_ids: ris.map {|ri| ri.reserved_instances_id},
+      client_token: client_token,
+      target_configurations: [
+                              {
+                                availability_zone: nil,
+                                instance_count: total_instance_count,
+                                instance_type: ris.first.instance_type,
+                                platform: platform,
+                                scope: 'Region'
+                              }
+                             ]
+    }
+
+    resp = ec2.modify_reserved_instances(params)
+
+    mod_ids = [resp.reserved_instances_modification_id]
+    wait_until_rimod_done(ec2, mod_ids)
+
+    resp = ec2.describe_reserved_instances_modifications({reserved_instances_modification_ids: mod_ids})
+
+    mod_result = resp.reserved_instances_modifications.first
+    mod_result = mod_result.modification_results.first
+
+    ri_model = build_ri_model(instance_count: mod_result.target_configuration.instance_count,
+                              instance_type: mod_result.target_configuration.instance_type,
+                              lease_id: mod_result.reserved_instances_id,
+                              scope: mod_result.target_configuration.scope)
+
+    ri_ids_to_rm = ris.map{|r| r.reserved_instances_id}
+    ris_to_join.delete_if{|r| ri_ids_to_rm.include?(r[:lease_id])}
+
+    ris_to_join << ri_model
+    ri_splits_s[:ri_joins] = ris_to_join
+  end
+end
+
+# Recombine a list of RIs into a single aggregate RI
+# (assumes all RIs share the same instance_type and end date)
+#
+def do_recombine_ris(ec2, ris)
+  total_recombine_count = ris.map{|r| r.instance_count}.inject(:+)
+
+  modify_params = {
+      reserved_instances_ids: ris.map {|ri| ri.reserved_instances_id},
+      client_token: SecureRandom.uuid,
+      target_configurations: []
+  }
+
+  modify_params[:target_configurations] << build_target_config(ris.first, total_recombine_count)
+
+  resp = ec2.modify_reserved_instances(modify_params)
+
+  mod_ids = [resp.reserved_instances_modification_id]
+  wait_until_rimod_done(ec2, mod_ids)
+
+  resp = ec2.describe_reserved_instances_modifications({reserved_instances_modification_ids: mod_ids})
+  if resp.reserved_instances_modifications.size != mod_ids.size
+    raise "Unexpected number of results: #{resp.reserved_instances_modifications.inspect}"
+  end
+
+  mod_results = resp.reserved_instances_modifications.first
+  new_ri = mod_results.modification_results.first
+
+  get_reserved_instances(ec2, [new_ri.reserved_instances_id]).first
+end
+
+def do_ri_cover_ecd(ec2, ri_offerings, ecd_s, ri_splits_s, ri_region)
+  ecd_coverage = ecd_s[:ecd_coverage]
+  ris_to_join = ri_splits_s[:ri_joins]
+
+  if ris_to_join.empty?
+    puts "No unused RIs left"
+    return
+  end
+
+  # Find the first one we can cover at least one instance
+  ecd = ecd_coverage.find{ |e|
+    inst_size = inst_class_to_base_size(e[:family])
+    instances = e[:ec2nf] / Float(inst_size_to_nf(inst_size))
+    Integer(instances) >= 1
+  }
+
+  unless ecd
+    puts "No instances require coverage"
+    return
+  end
+
+  inst_class = ecd[:family]
+  inst_size = inst_class_to_base_size(inst_class)
+
+  ri_dest_inst_count = Integer(ecd[:ec2nf] / Float(inst_size_to_nf(inst_size)))
+  ri_dest_inst_type = make_inst_type(inst_class, inst_size)
+
+  #
+  # Check that there is a matching offering
+  #
+  check_ri_offering(ri_offerings, ri_dest_inst_type, ri_region)
+
+  puts "Going to try and cover #{ri_dest_inst_count} of #{ri_dest_inst_type}"
+
+  ris_to_join.sort!{|a, b| b[:instance_count] <=> a[:instance_count]}
+
+  source_ri_model = ris_to_join.first
+
+  puts "source RI"
+  pp source_ri_model
+
+  split_results = ri_split(ec2, source_ri_model[:lease_id])
+  unless split_results.reserved_instances_modifications.size == 1
+    raise 'Unexpected number of mods'
+  end
+
+  split_results = split_results.reserved_instances_modifications.first
+  split_ri_ids = split_results.modification_results.map {|mr| mr.reserved_instances_id}
+
+  split_ris = get_reserved_instances(ec2, split_ri_ids)
+
+  ris_to_join.delete_if{|r| r[:lease_id] == source_ri_model[:lease_id]}
+
+  puts "split ris:"
+  pp split_ri_ids
+
+  ris = SubsetSumRis.new
+  split_ris.each do |reserved_instance|
+    ris[reserved_instance.instance_count] = reserved_instance
+  end
+
+  total_ri_count = ris.total_count
+  subset_sums = get_subset_sums(total_ri_count)
+
+  subset_sums.each do |i|
+    unless ris[i]
+      raise "No RI count for subset sum #{i}"
+    end
+  end
+
+  subset_sums.sort!
+
+  last_quote = nil
+  loop do
+    puts
+    puts "Looking for #{ri_dest_inst_count} #{ri_dest_inst_type}"
+
+    # Binary search the subset sums!
+    first = 1
+    last = total_ri_count
+
+    highest_match_inst_count = 0
+    exceeded_instance_count = false
+    last_quote = nil
+    curr_quote = nil
+    while first <= last
+      count = (first + last) / 2
+
+      sums = subset_sum(subset_sums, count)
+
+      selected_ris = ris.select_all(sums)
+
+      quote = get_ri_exchange_quote(ec2, ri_offerings, selected_ris, ri_dest_inst_type, ri_region)
+
+      target_res_value = quote.target_configuration_value_set.first
+      curr_quote = {
+        source_instance_count: count,
+        source_instance_type: source_ri_model[:instance_type],
+        source_subset_sums: sums,
+        target_instance_count: target_res_value.target_configuration.instance_count,
+        target_instance_type: ri_dest_inst_type,
+        target_offering_id: target_res_value.target_configuration.offering_id,
+        payment_due: quote.payment_due,
+        selected_ris: selected_ris
+      }
+
+      puts '...for %d %s can get %d %s for price %4.2f: %s' %
+        [count, curr_quote[:source_instance_type], curr_quote[:target_instance_count],
+         ri_dest_inst_type, curr_quote[:payment_due], curr_quote[:target_offering_id]]
+
+      if curr_quote[:target_instance_count] == ri_dest_inst_count
+        last_quote = curr_quote
+      end
+
+      if curr_quote[:target_instance_count] > highest_match_inst_count
+        highest_match_inst_count = curr_quote[:target_instance_count]
+      end
+
+      if curr_quote[:target_instance_count] > ri_dest_inst_count
+        exceeded_instance_count = true
+      end
+
+      if curr_quote[:target_instance_count] <= ri_dest_inst_count
+        first = count + 1
+      else
+        last = count - 1
+      end
+    end
+
+    if last_quote && last_quote[:target_instance_count] == ri_dest_inst_count &&
+        exceeded_instance_count
+      #
+      # Success, print details and break to await confirmation
+      #
+
+      puts
+      puts 'Best matching quote:'
+      puts
+      puts " Source instances:\t#{last_quote[:source_instance_count]} #{last_quote[:source_instance_type]} (#{total_ri_count - last_quote[:source_instance_count]} left)"
+      puts " Destination instances:\t#{last_quote[:target_instance_count]} #{last_quote[:target_instance_type]}"
+      puts " Source subsets:\t#{last_quote[:source_subset_sums]}"
+      puts " Source RI IDS:\t\t#{last_quote[:selected_ris].map {|ri| ri.reserved_instances_id}.join(", ")}"
+      puts " Exchange cost:\t\t$#{last_quote[:payment_due]}"
+      puts
+
+      break
+    elsif !exceeded_instance_count
+      #
+      # This means we never exceeded the count we were looking for,
+      # meaning we can't know if this is the best deal available.
+      # Drop one instance size down from the max we've seen and try
+      # again -- it's likely this value is the best we can do.
+      #
+
+      if highest_match_inst_count > 1
+        ri_dest_inst_count = highest_match_inst_count - 1
+
+        puts "Can not verify matched quote is optimal, retrying for #{ri_dest_inst_count} instances"
+      else
+        puts "Can not verify matched quote is optimal, bailing"
+
+        # No good, recombine and exit
+        new_ri = do_recombine_ris(ec2, ris.values)
+
+        ris_to_join << build_ri_model_from_ri(new_ri)
+        ri_splits_s[:ri_joins] = ris_to_join
+
+        return
+      end
+    else
+      puts 'NO MATCH FOUND FOR EXCHANGE'
+
+      new_ri = do_recombine_ris(ec2, ris.values)
+
+      ris_to_join << build_ri_model_from_ri(new_ri)
+      ri_splits_s[:ri_joins] = ris_to_join
+
+      return
+    end
+  end
+
+  confirm = wait_for_confirm
+
+  if confirm
+    puts 'Accepting the exchange...'
+
+    resp = accept_ri_exchange_quote(ec2, ri_offerings, last_quote[:selected_ris], ri_dest_inst_type, ri_region)
+    unless resp.exchange_id
+      raise "Exchange failed, resp: #{resp.inspect}"
+    end
+
+    wait_until_exchange_done(ec2, last_quote[:selected_ris])
+
+    # Remove the source RIs
+    last_quote[:selected_ris].each do |ri|
+      ris.rm_ri(ri)
+    end
+
+    inst_nf = inst_type_to_nf(last_quote[:target_instance_type])
+    ecd[:ec2nf] -= Float(last_quote[:target_instance_count]) * inst_nf
+
+    puts "Subtracting #{last_quote[:target_instance_count]} * #{inst_nf} = #{last_quote[:target_instance_count]*inst_nf} EC2NF"
+
+    ecd_s[:ecd_coverage] = ecd_coverage
+  else
+    puts 'No exchange made.'
+  end
+
+  if ris.empty?
+    puts 'No more remaining RIs'
+    return
+  end
+
+  puts
+  puts 'Recombining remaining RIs into a single RI'
+
+  new_ri = do_recombine_ris(ec2, ris.values)
+
+  ris_to_join << build_ri_model_from_ri(new_ri)
+  ri_splits_s[:ri_joins] = ris_to_join
+
+  puts
+  puts 'Remaining RI: %d %s (ID: %s)' %
+           [new_ri.instance_count, new_ri.instance_type,
+            new_ri.reserved_instances_id]
+end
+
+
+def do_ri_conversion(ec2, costexplorer, ri_offerings, on_demand_prices, ri_region, ri_checkpoint_dir)
+  look_back = 2
+  period = 1
+  time_period = get_time_range(look_back + period, period)
+  coverage_hours = (Time.parse(time_period[1]) - Time.parse(time_period[0])) / 3600
+
+  if Integer(coverage_hours) % 24 != 0
+    raise "Expected an even day count on coverage hours"
+  end
+
+  puts "coverage hours: #{coverage_hours}"
+
+  checkpointer = Checkpointer.new(ri_checkpoint_dir)
+
+  ecd_s = StateTracker.new(checkpointer, "ecd_coverage-#{ri_region}")
+
+  if ecd_s.empty?
+    ecd_ranked_coverages = get_ri_coverage_ecd_report(ec2, costexplorer,
+                                                      ri_offerings, on_demand_prices, ri_region,
+                                                      time_period)
+    ecd_s[:ecd_coverage] = ecd_ranked_coverages
+  end
+
+  if ecd_s[:ecd_coverage].empty?
+    return
+  end
+
+  puts "Instance families that require coverage:"
+  puts
+  puts "%-5s%8s  %-7s" %
+    ["Inst", "EC2NF", "ECD"]
+  ecd_s[:ecd_coverage].each do |ecd|
+    puts "%-5s%8.2f  %-5.3f" % [ecd[:family], ecd[:ec2nf], ecd[:ecd]]
+  end
+  puts
+
+  ## NOW find the under used RIs...
+  ##
+
+  riutil_s = StateTracker.new(checkpointer, "ri_utilization-#{ri_region}")
+
+  if riutil_s.empty?
+    ri_util = get_ri_utilization_report(ec2, costexplorer, ri_offerings, ri_region, time_period)
+
+    ri_util.each do |ri|
+      ri[:unused_instances] = Float(ri[:unused_hours]) / Float(coverage_hours)
+    end
+
+    ri_util.delete_if {|ri| ri[:unused_instances] < 1.0 }
+
+    riutil_s[:ri_util] = ri_util
+  end
+
+  if riutil_s[:ri_util].empty?
+    puts "No available RIs to exchange"
+    return
+  end
+
+  ri_splits_s = StateTracker.new(checkpointer, "ri_splits-#{ri_region}")
+
+  if ri_splits_s.empty?
+    ri_splits = get_unused_ri_conversion_splits(ec2, checkpointer,
+                                                Float(coverage_hours),
+                                                riutil_s, ri_region)
+
+    unless ri_splits
+      return
+    end
+
+    ri_splits_s.set(ri_splits)
+  end
+
+  split_results_s = StateTracker.new(checkpointer, "ri_split_results-#{ri_region}")
+
+  if split_results_s.empty?
+    split_results = split_unused_ri_conversions(ec2, checkpointer,
+                                                coverage_hours, ri_splits_s, ri_region)
+    split_results_s[:results] = split_results
+  end
+
+  finish_split_unused_ri_conversions(ec2, checkpointer, coverage_hours, ri_splits_s,
+                                     split_results_s, ri_region)
+
+  do_ri_join_and_exchange(ec2, ri_offerings, ri_splits_s, ri_region)
+
+  do_ri_cover_ecd(ec2, ri_offerings, ecd_s, ri_splits_s, ri_region)
+
+  puts "Remaining instance coverage:"
+  puts
+  puts "%-5s%8s  %-7s" %
+    ["Inst", "EC2NF", "ECD"]
+  ecd_s[:ecd_coverage].each do |ecd|
+    puts "%-5s%8.2f  %-5.3f" % [ecd[:family], ecd[:ec2nf], ecd[:ecd]]
+  end
+end
+
+opts = Optimist::options do
+  opt :aws_key, 'AWS key', :type => :string, :default => ENV['AWS_ACCESS_KEY']
+  opt :aws_secret_key, 'AWS secret key', :type => :string, :default => ENV['AWS_SECRET_ACCESS_KEY']
+  opt :aws_id, 'AWS ID', :type => :string, :default => ENV['AMAZON_AWS_ID']
+
+  opt :ri_split, 'Split RI into subset sums', :type => :boolean
+  opt :ri_instance_id, 'RI instance ID', :type => :string
+
+  opt :ri_modify_status, 'Get status of an RI modify', :type => :boolean
+  opt :ri_instance_modify_id, 'RI instance modification ID', :type => :string
+
+  opt :ri_join, 'Join RIs into a single RI', :type => :boolean
+  opt :ri_join_all, 'Join all RIs with like class/end date', :type => :boolean
+  opt :ri_join_skip, 'Instance families to skip joining', :type => :string
+
+  opt :ri_coverage, 'Coverage report', :type => :boolean
+
+  opt :ri_utilization, 'RI Utilization report', :type => :boolean
+  opt :output_yaml, 'Output as YAML', :type => :string
+
+  opt :ri_exchange_unused, 'RI exchange all unused RI hours', :type => :boolean
+  opt :ri_util_report, 'Input YAML file of RI util (generate with --ri-utilization)', :type => :string
+
+  opt :ri_base_inst_type, 'Base instance type', :type => :string, :default => INST_TYPE_BASE
+
+  opt :ri_exchange, 'Exchange RIs based on optimal fit', :type => :boolean
+  opt :ri_source_id, 'Source RI ID', :type => :string
+  opt :ri_dest_inst_count, 'How many instances are we looking for', :type => :integer
+  opt :ri_dest_inst_type, 'Destination instance type', :type => :string
+  opt :convert_to_base, 'Convert dest inst to base type', :type => :boolean
+
+  opt :ri_make_regional, 'Modify all AZ reservations to Regional', :type => :boolean
+
+  opt :ri_conversion, 'Fully automated RI conversion', :type => :boolean
+  opt :ri_region, 'Region to convert', :type => :string
+  opt :ri_checkpoint_dir, 'Directory to checkpoint state', :type => :string, :default => "checkpoints"
+end
+
+if blank?(opts[:aws_key]) || blank?(opts[:aws_secret_key]) || blank?(opts[:aws_id])
+  raise "Invalid options: #{opts.inspect}"
+end
+
+if opts[:ri_split] && blank?(opts[:ri_instance_id])
+  raise 'RI split requires `--ri-instance-id`'
+end
+
+if opts[:ri_modify_status] && blank?(opts[:ri_instance_modify_id])
+  raise 'RI modify status requires `--ri-instance-modify-id`'
+end
+
+if opts[:ri_exchange] &&
+    (blank?(opts[:ri_source_id]) || blank?(opts[:ri_dest_inst_count]) ||
+        blank?(opts[:ri_dest_inst_type]))
+  raise 'Invalid options for RI exchange'
+end
+
+if opts[:ri_join] &&
+    (blank?(opts[:ri_source_inst_type]) && !opts[:ri_join_all])
+  raise 'Requires --ri-source-inst-type or --ri-join-all'
+end
+
+if opts[:ri_exhange_unused] &&
+    (blank?(opts[:ri_util_report]) || blank?(opts[:aws_id]) || blank?(opts[:ri_dest_inst_type]))
+  raise 'Invalid arguments for ri-exchange-unused'
+end
+
+# Require explicit region for `ri-conversion`
+if opts[:ri_conversion] &&
+    blank?(opts[:ri_region])
+  raise 'Invalid arguments for --ri-conversion'
+end
+
+# Default region for everything else
+if blank?(opts[:ri_region])
+  opts[:ri_region] = REGION
+end
+
+if opts[:ri_region] && REGION_LOC_MAP[opts[:ri_region].to_sym].nil?
+  raise "Invalid region name: #{opts[:ri_region]}"
+end
+
+res = Aws::CostExplorer::Resource.new(
+    region: 'us-east-1',
+    access_key_id: opts[:aws_key],
+    secret_access_key: opts[:aws_secret_key]
+)
+ce = res.client
+
+puts "Running in account #{opts[:aws_id]} in region #{REGION}"
+res = Aws::EC2::Resource.new(
+    region: opts[:ri_region],
+    access_key_id: opts[:aws_key],
+    secret_access_key: opts[:aws_secret_key]
+)
+ec2 = res.client
+
+# XXX: Always use active region for CE
+res = Aws::CostExplorer::Resource.new(
+    region: REGION,
+    access_key_id: opts[:aws_key],
+    secret_access_key: opts[:aws_secret_key]
+)
+costexplorer = res.client
+
+res = Aws::Pricing::Resource.new(
+    region: REGION,
+    access_key_id: opts[:aws_key],
+    secret_access_key: opts[:aws_secret_key]
+)
+pricing = res.client
+
+if opts[:ri_split]
+  do_ri_split(ec2, opts[:ri_instance_id])
+elsif opts[:ri_modify_status]
+  do_ri_modify_status(ec2, opts[:ri_instance_modify_id])
+elsif opts[:ri_exchange]
+  do_ri_exchange(ec2,
+                 load_ri_offerings(ec2, opts[:ri_region]),
+                 opts[:ri_source_id],
+                 opts[:ri_dest_inst_count],
+                 opts[:ri_dest_inst_type],
+                 opts[:convert_to_base])
+elsif opts[:ri_accept_exchange]
+  do_ri_accept_exchange(ec2, opts[:ri_exchange_offering_id])
+elsif opts[:ri_join]
+  do_ri_join(ec2, opts[:ri_source_inst_type], opts[:ri_join_all], opts[:ri_join_skip])
+elsif opts[:ri_coverage]
+  do_ri_coverage(costexplorer)
+elsif opts[:ri_utilization]
+  do_ri_utilization(costexplorer, opts[:output_yaml])
+elsif opts[:ri_make_regional]
+  do_ri_make_regional(ec2)
+elsif opts[:ri_exchange_unused]
+  do_ri_exchange_unused(ec2,
+                        load_ri_offerings(ec2, opts[:ri_region]),
+                        opts[:aws_id],
+                        opts[:ri_util_report],
+                        opts[:ri_base_inst_type])
+elsif opts[:ri_conversion]
+  do_ri_conversion(ec2,
+                   costexplorer,
+                   load_ri_offerings(ec2, opts[:ri_region]),
+                   load_on_demand_pricing(pricing, opts[:ri_region]),
+                   opts[:ri_region],
+                   opts[:ri_checkpoint_dir]
+                   )
+end
+
+exit 0
