@@ -189,6 +189,15 @@ of an i3.8xlarge.
 
 Bug reports and pull requests are welcome on GitHub at https://github.com/mheffner/aws-ri-convert.
 
+## References
+
+* [Cost Optimization at Scale -
+  Quora](https://engineering.quora.com/Automated-Infrastructure-Cost-Optimization-at-Scale-with-AWS-EC2-Reserved-Instances)
+* [On-Demand Capacity Reservations -
+  AWS](https://aws.amazon.com/about-aws/whats-new/2018/10/Amazon-EC2-now-offers-On-Demand-Capacity-Reservations/)
+* [CostExplorer Normalized Units -
+  AWS](https://aws.amazon.com/about-aws/whats-new/2019/02/normalized-units-information-for-amazon-ec2-reservations-in-aws-cost-explorer/)
+
 ## License
 
 The gem is available as open source under the terms of the [MIT License](https://opensource.org/licenses/MIT).
