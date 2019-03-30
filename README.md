@@ -117,7 +117,7 @@ combined as that can adjust their coverage. This can reduce sprawl of
 RIs after multiple conversions or due to separate purchasing.
 
 ```
-$ bundle exec ./bin/aws-ri-convert --ri-join --ri-join-all
+$ bundle exec ./bin/aws-ri-convert --ri-join --ri-region <us-east-1, us-west-2, ...>
 ```
 
 ### Convert RIs to match usage
