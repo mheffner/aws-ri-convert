@@ -19,12 +19,15 @@ require 'aws/ri/convert'
 include Aws::Ri::Convert
 
 REGION = ENV['AWS_DEFAULT_REGION'] || 'us-east-1'
-INST_CLASS_TYPES = %w(m1 m3 m4 m5 c3 c4 c5 i2 i3 r3 r4 r5 t2 t3)
-#INST_TYPES = %w(c5)
 INST_SIZE = 'large'
+
+LINUX_VPC = 'Linux/UNIX (Amazon VPC)'
 
 RI_OFFERINGS_FILE = 'reserved_instance_offerings'
 SUBSET_SUMS_FILE = 'subset_sums.yml'
+
+# Cache RI offerings for up to 30 days
+RI_OFFERINGS_CACHE_TTL_SECS = 30 * 86400
 
 INST_TYPE_BASE = 't2.nano'
 
@@ -191,7 +194,7 @@ def get_reserved_instances(ec2, ri_instance_ids)
   resp.reserved_instances
 end
 
-def load_on_demand_pricing_instance(pricing, ri_region, instance_type)
+def load_on_demand_pricing_instance(pricing, instance_type, ri_region)
   filters = {
     ServiceCode: "AmazonEC2",
     instanceType: instance_type,
@@ -234,7 +237,7 @@ def load_on_demand_pricing_instance(pricing, ri_region, instance_type)
     region: ri_region,
     location: attrs['location'],
     instance_type: attrs['instanceType'],
-    instance_family: inst_type_to_family(attrs['instanceType']),
+    instance_family: inst_type_to_class(attrs['instanceType']),
     termType: filters[:termType],
     sku: on_demand_terms['sku'],
     offer_term_code: on_demand_terms['offerTermCode'],
@@ -243,91 +246,110 @@ def load_on_demand_pricing_instance(pricing, ri_region, instance_type)
   }
 end
 
-def load_on_demand_pricing(pricing, ri_region)
+def load_on_demand_pricing(pricing, ri_offerings, ri_region)
   on_demand_pricing = []
 
-  INST_CLASS_TYPES.each do |inst|
-    # t2 only one different...
-    inst_size = inst == 't2' ? 'nano' : INST_SIZE
-
-    price = load_on_demand_pricing_instance(pricing, ri_region, make_inst_type(inst, inst_size))
+  ri_offerings.each do |offering|
+    price = load_on_demand_pricing_instance(pricing, offering[:instance_type], offering[:region])
     on_demand_pricing << price if price
   end
 
   on_demand_pricing
 end
 
-def ec2_load_ri_offering(ec2, ri_region, inst_class, inst_size)
-  instance_type = make_inst_type(inst_class, inst_size)
+# Find EC2 RI offerings for each base type
+def ec2_load_ri_offerings(ec2, ri_region)
+  puts "Loading RI offerings for #{ri_region}"
 
-  params = {
+  offerings = {}
+  next_token = nil
+
+  loop do
+    params = {
       include_marketplace: false,
-      instance_type: instance_type,
       offering_class: 'convertible',
-      product_description: 'Linux/UNIX (Amazon VPC)',
+      product_description: LINUX_VPC,
       offering_type: 'All Upfront',
       instance_tenancy: 'default',
       filters: [
-          {name: 'scope', values: ['Region']},
-          {name: 'duration', values: ['94608000']}
-      ]
-  }
-  resp = ec2.describe_reserved_instances_offerings(params)
+                {name: 'scope', values: ['Region']},
+                {name: 'duration', values: ['94608000']}
+               ]
+    }
 
-  if !resp || resp.reserved_instances_offerings.empty?
-    puts "No reserved instance offerings found for #{instance_type}"
-    return nil
-  end
-
-  if resp.reserved_instances_offerings.size > 1
-    offer_ids = resp.reserved_instances_offerings.map {|offer| offer.reserved_instances_offering_id}
-    puts "WARN: Multiple RI offerings for #{instance_type}: #{offer_ids.inspect}"
-  end
-
-  offering = resp.reserved_instances_offerings.first
-
-  #pp offering
-
-  {
-    instance_type: offering.instance_type,
-    instance_class: inst_class,
-    instance_size: inst_size,
-    fixed_price: offering.fixed_price,
-    usage_price: offering.usage_price,
-    duration: offering.duration,
-    offering_id: offering.reserved_instances_offering_id,
-    offering_class: offering.offering_class,
-    offering_type: offering.offering_type,
-    scope: offering.scope,
-    region: ri_region
-  }
-end
-
-def ec2_load_ri_offerings(ec2, ri_region)
-  offerings = []
-  INST_CLASS_TYPES.each do |inst|
-    # t2 only one different...
-    inst_size = inst == 't2' ? 'nano' : INST_SIZE
-
-    if offering = ec2_load_ri_offering(ec2, ri_region, inst, inst_size)
-      offerings << offering
+    if !blank?(next_token)
+      params[:next_token] = next_token
     end
+
+    resp = ec2.describe_reserved_instances_offerings(params)
+
+    if !resp || resp.reserved_instances_offerings.empty?
+      break
+    end
+
+    resp.reserved_instances_offerings.each do |offering|
+      inst_class = inst_type_to_class(offering.instance_type)
+      inst_size = inst_type_to_size(offering.instance_type)
+
+      base_size = inst_class_to_base_size(inst_class)
+
+      if inst_size != base_size
+        next
+      end
+
+      # A map will reduce potential multiple RI offerings for the same
+      # type
+
+      if offerings[offering.instance_type]
+        puts "Multiple RI offerings for #{offering.instance_type}, using latest one"
+      end
+
+      offerings[offering.instance_type] = {
+        instance_type: offering.instance_type,
+        instance_class: inst_class,
+        instance_size: inst_size,
+        fixed_price: offering.fixed_price,
+        usage_price: offering.usage_price,
+        duration: offering.duration,
+        offering_id: offering.reserved_instances_offering_id,
+        offering_class: offering.offering_class,
+        offering_type: offering.offering_type,
+        scope: offering.scope,
+        region: ri_region
+      }
+    end
+
+    if blank?(resp.next_token)
+      break
+    end
+
+    next_token = resp.next_token
   end
 
-  offerings
+  offerings.values
 end
 
 def load_ri_offerings(ec2, ri_region)
   filename = '%s-region=%s.yml' % [RI_OFFERINGS_FILE, ri_region]
 
   if File.exist?(filename)
-    YAML.load(File.read(filename))
-  else
-    offerings = ec2_load_ri_offerings(ec2, ri_region)
-
-    File.write(filename, YAML.dump(offerings))
-    offerings
+    yaml = YAML.load(File.read(filename))
+    if yaml[:created_at] + RI_OFFERINGS_CACHE_TTL_SECS <= Time.now.tv_sec
+      yaml = nil
+    else
+      return yaml[:offerings]
+    end
   end
+
+  offerings = ec2_load_ri_offerings(ec2, ri_region)
+  yaml = {
+    created_at: Time.now.tv_sec,
+    offerings: offerings
+  }
+
+  File.write(filename, YAML.dump(yaml))
+
+  offerings
 end
 
 def find_ri_offering(offerings, opts)
@@ -571,13 +593,17 @@ def list_reserved_instances(ec2, filters)
   resp
 end
 
-def inst_type_to_family(instance_type)
+def inst_type_to_class(instance_type)
   instance_type.split('.').first
+end
+
+def inst_type_to_size(instance_type)
+  instance_type.split('.').last
 end
 
 # https://aws.amazon.com/blogs/aws/new-instance-size-flexibility-for-ec2-reserved-instances/
 def inst_type_to_nf(instance_type)
-  inst_size_to_nf(instance_type.split('.').last)
+  inst_size_to_nf(inst_type_to_size(instance_type))
 end
 
 def inst_size_to_nf(instance_size)
@@ -653,7 +679,7 @@ def do_ri_join(ec2, ri_join_skip)
 
   inst_groups = {}
   resp.reserved_instances.each do |reserved_instance|
-    family = inst_type_to_family(reserved_instance.instance_type)
+    family = inst_type_to_class(reserved_instance.instance_type)
     ec2nf = inst_type_to_nf(reserved_instance.instance_type)
     key = "#{family}::#{reserved_instance.end}::#{reserved_instance.product_description}"
 
@@ -908,7 +934,7 @@ def get_ri_coverage_ecd_report(ec2, costexplorer, ri_offerings, on_demand_prices
   inst_family_coverage = {}
 
   coverages.each do |coverage|
-    family = inst_type_to_family(coverage[:instance_type])
+    family = inst_type_to_class(coverage[:instance_type])
     ec2nf = inst_type_to_nf(coverage[:instance_type])
     ec2nf *= coverage[:on_demand_instances]
 
@@ -1794,10 +1820,11 @@ if opts[:ri_join]
 elsif opts[:ri_make_regional]
   do_ri_make_regional(ec2)
 elsif opts[:ri_conversion]
+  ri_offerings = load_ri_offerings(ec2, opts[:ri_region])
   do_ri_conversion(ec2,
                    costexplorer,
-                   load_ri_offerings(ec2, opts[:ri_region]),
-                   load_on_demand_pricing(pricing, opts[:ri_region]),
+                   ri_offerings,
+                   load_on_demand_pricing(pricing, ri_offerings, opts[:ri_region]),
                    opts[:ri_region],
                    opts[:ri_checkpoint_dir]
                    )
