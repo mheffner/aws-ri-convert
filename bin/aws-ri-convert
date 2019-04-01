@@ -606,6 +606,9 @@ def inst_type_to_nf(instance_type)
   inst_size_to_nf(inst_type_to_size(instance_type))
 end
 
+# TODO: Pull dynamically from Pricing API:
+# https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/index.json
+#
 def inst_size_to_nf(instance_size)
   ec2nf = case instance_size
           when 'nano'
@@ -622,17 +625,30 @@ def inst_size_to_nf(instance_size)
             8
           when '2xlarge'
             16
+          when '3xlarge'
+            24
           when '4xlarge'
             32
+          when '6xlarge'
+            48
           when '8xlarge'
             64
+          when '9xlarge'
+            72
           when '10xlarge'
             80
+          when '12xlarge'
+            96
           when '16xlarge'
             128
+          when '18xlarge'
+            144
+          when '24xlarge'
+            192
           when '32xlarge'
             256
           else
+            # Howto handle "metal"?
             raise "Unknown instance size: #{instance_size}"
           end
   Float(ec2nf)
