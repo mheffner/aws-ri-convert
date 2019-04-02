@@ -18,7 +18,7 @@ require 'aws/ri/convert'
 
 include Aws::Ri::Convert
 
-REGION = ENV['AWS_DEFAULT_REGION'] || 'us-east-1'
+REGION = ENV['AWS_DEFAULT_REGION']
 INST_SIZE = 'large'
 
 LINUX_VPC = 'Linux/UNIX (Amazon VPC)'
