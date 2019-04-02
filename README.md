@@ -106,7 +106,7 @@ Pricing APIs. (TODO: explicitly list the required perms)
 Convert all RIs to region scoped:
 
 ```
-$ bundle exec ./bin/aws-ri-convert --ri-make-regional
+$ bundle exec ./bin/aws-ri-convert --ri-make-regional --ri-region <us-east-1, us-west-2, ...>
 ```
 
 ### Join all RIs into minimal RI list

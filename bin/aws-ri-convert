@@ -18,7 +18,7 @@ require 'aws/ri/convert'
 
 include Aws::Ri::Convert
 
-REGION = ENV['AWS_DEFAULT_REGION'] || 'us-east-1'
+REGION = ENV['AWS_DEFAULT_REGION']
 INST_SIZE = 'large'
 
 LINUX_VPC = 'Linux/UNIX (Amazon VPC)'
@@ -28,6 +28,8 @@ SUBSET_SUMS_FILE = 'subset_sums.yml'
 
 # Cache RI offerings for up to 30 days
 RI_OFFERINGS_CACHE_TTL_SECS = 30 * 86400
+
+DURATION_36_MONTHS = '94608000'
 
 INST_TYPE_BASE = 't2.nano'
 
@@ -273,7 +275,7 @@ def ec2_load_ri_offerings(ec2, ri_region)
       instance_tenancy: 'default',
       filters: [
                 {name: 'scope', values: ['Region']},
-                {name: 'duration', values: ['94608000']}
+                {name: 'duration', values: [DURATION_36_MONTHS]}
                ]
     }
 
@@ -566,7 +568,7 @@ def list_reserved_instances(ec2, filters)
   params = {
       filters: [{
                     name: 'duration',
-                    values: ['94608000']
+                    values: [DURATION_36_MONTHS]
                 },
                 {
                     name: 'state',
@@ -610,47 +612,32 @@ end
 # https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/index.json
 #
 def inst_size_to_nf(instance_size)
-  ec2nf = case instance_size
-          when 'nano'
-            0.25
-          when 'micro'
-            0.5
-          when 'small'
-            1
-          when 'medium'
-            2
-          when 'large'
-            4
-          when 'xlarge'
-            8
-          when '2xlarge'
-            16
-          when '3xlarge'
-            24
-          when '4xlarge'
-            32
-          when '6xlarge'
-            48
-          when '8xlarge'
-            64
-          when '9xlarge'
-            72
-          when '10xlarge'
-            80
-          when '12xlarge'
-            96
-          when '16xlarge'
-            128
-          when '18xlarge'
-            144
-          when '24xlarge'
-            192
-          when '32xlarge'
-            256
-          else
-            # Howto handle "metal"?
-            raise "Unknown instance size: #{instance_size}"
-          end
+  size_factors = {
+    'nano':    0.25,
+    'micro':    0.5,
+    'small':      1,
+    'medium':     2,
+    'large':      4,
+    'xlarge':     8,
+    '2xlarge':   16,
+    '3xlarge':   24,
+    '4xlarge':   32,
+    '6xlarge':   48,
+    '8xlarge':   64,
+    '9xlarge':   72,
+    '10xlarge':  80,
+    '12xlarge':  96,
+    '16xlarge': 128,
+    '18xlarge': 144,
+    '24xlarge': 192,
+    '32xlarge': 256
+  }
+
+  unless ec2nf = size_factors[instance_size.to_sym]
+    # Howto handle "metal"?
+    raise "Unknown instance size: #{instance_size}"
+  end
+
   Float(ec2nf)
 end
 
