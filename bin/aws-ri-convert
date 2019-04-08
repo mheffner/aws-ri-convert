@@ -1348,13 +1348,15 @@ def do_ri_join_and_exchange(ec2, ri_offerings, ri_splits_s, ri_region)
     end
   end
 
+  vpc_only = is_vpc_only(ec2)
+
   ri_join_map.each do |key, ris|
     next if ris.size == 1
 
     total_instance_count = ris.map {|ri| ri.instance_count}.inject(:+)
     client_token = SecureRandom.uuid
 
-    if ris.first.product_description.include?('VPC')
+    if vpc_only || ris.first.product_description.include?('VPC')
       platform = 'EC2-VPC'
     else
       platform = 'EC2-Classic'
